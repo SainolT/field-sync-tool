@@ -19,6 +19,8 @@ pip install openpyxl
 python sync_gui.py          # 或双击 字段同步工具.vbs（Windows 无黑窗启动）
 ```
 
+也可以直接在 [Releases](../../releases) 页面下载打包好的 exe（免装 Python）和工具表模板。
+
 首次启动会引导你选择或新建一个工具表（含「总表」「字段表」「使用说明」三个 sheet）。工具表和被管理的 xlsx 放在同一目录（支持子目录）。
 
 ## 打包为 exe（可选）
