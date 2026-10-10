@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+扫描缓存.json
+工具配置.json
+字段同步备份/
+build/
+dist/
+*.spec
