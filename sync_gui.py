@@ -18,6 +18,7 @@
   · 各表格表头都应在第 1 行
 """
 import json
+import os
 import shutil
 import sys
 import tkinter as tk
@@ -71,15 +72,16 @@ INSTRUCTIONS = [
     ("· 数据源中该值为空的行不同步(不会清空目标数据)", False),
     ("· 各表格的表头都应在第 1 行", False),
     ("· 所有操作都只改写数据区(第 2 行起), 不会修改任何表格的表头", False),
+    ("· 公式保护: 源值是公式的不同步/不参照, 目标单元格是公式的不覆盖, 均会在日志给出警告", False),
     ("", False),
     ("五、字段替换(页签2)", True),
-    ("场景: 某列表头登记的是ID类字段, 但你临时填了名称, 想批量翻译回ID", False),
-    ("1. 「被替换字段」: 逐级选择 文件→子表→字段(所有字段都能选, 含未登记的; 可多选, 跨子表累积); 输入关键字时切换为完整路径平铺筛选", False),
-    ("2. 「当前值是」: 列里现在填的内容属于哪个映射组(如 作物名称)", False),
-    ("3. 「替换成」: 要变成哪个映射组的值(如 道具ID)", False),
-    ("4. 「参照表」: 选一张同时登记了这两个组的表当字典(自动筛选候选)", False),
-    ("5. 预览 → 开始替换", False),
-    ("· 在参照表找不到的值保留原样并列入日志; 空单元格跳过; 重复对照取第一行并警告", False),
+    ("共用: 「被替换字段」逐级选择 文件→子表→字段(所有字段都能选, 含未登记的; 可多选, 跨子表累积);", False),
+    ("     输入关键字时切换为完整路径平铺筛选", False),
+    ("方式一「按参照表(映射组)」: 声明 当前值是/替换成 两个映射组, 选一张同时登记了两组的表当字典;", False),
+    ("  被替换列里的当前值去参照表查, 找到就替换。适合『ID列里临时填了名称, 批量翻回ID』", False),
+    ("方式二「按字段匹配」: 选参照表格 + 匹配字段 + 取值字段; 按目标表同行的匹配字段值去参照表对齐行,", False),
+    ("  把取值字段的值写入被替换列。目标子表需有与匹配字段同名的列", False),
+    ("· 查不到对照的保留原样并列入日志; 空单元格跳过; 重复对照取第一行并警告", False),
     ("", False),
     ("六、常见问题", True),
     ("", False),
@@ -450,31 +452,76 @@ def delete_group(tool_path, group):
     return n
 
 
+def save_with_backup(wb, rel, base_dir, backup_dir, stamp):
+    """保存工作簿: 先把磁盘上的原文件备份一次, 再写入临时文件并原子替换原文件。
+    即使保存中途失败, 原文件也不会损坏。返回备份文件名（未备份返回 None）。"""
+    tp = base_dir / rel
+    bak_name = None
+    if backup_dir:
+        bdir = Path(backup_dir)
+        bdir.mkdir(parents=True, exist_ok=True)
+        safe = "__".join(Path(rel).with_suffix("").parts)
+        bak_name = f"{safe}.{stamp}{tp.suffix}"
+        shutil.copy2(tp, bdir / bak_name)  # 此刻磁盘上仍是原始文件
+    tmp = tp.with_name(tp.name + ".tmp")
+    wb.save(tmp)
+    os.replace(tmp, tp)
+    return bak_name
+
+
+def is_formula_like(v):
+    """判断单元格值是否是公式（或以 = 开头的文本，写入后会变成公式，有注入风险）。"""
+    return isinstance(v, str) and v.startswith("=")
+
+
+def header_map_of(ws):
+    """读取已打开工作表的第 1 行表头，返回 {列名: 列号(1-based)}。"""
+    hmap = {}
+    for c in ws[1]:
+        h = norm(c.value)
+        if h and h not in hmap:
+            hmap[h] = c.column
+    return hmap
+
+
 def read_sheet(path, sheet):
     """打开目标表格，返回 (workbook, worksheet, {列名: 列号})。"""
     wb = openpyxl.load_workbook(path)
     if sheet not in wb.sheetnames:
         raise KeyError(f"工作表「{sheet}」不存在于 {Path(path).name}")
     ws = wb[sheet]
-    hmap = {}
-    for c in ws[1]:
-        h = norm(c.value)
-        if h and h not in hmap:
-            hmap[h] = c.column
-    return wb, ws, hmap
+    return wb, ws, header_map_of(ws)
 
 
 def run_sync(base_dir, groups, key_group, src, sync_groups, targets, backup_dir, dry, log):
     """执行同步（dry=True 只预览不写盘）。src/targets 为 (文件, 表格)。
-    backup_dir 为 None 时不备份。返回改动单元格数。"""
+    backup_dir 为 None 时不备份。返回改动单元格数。
+    日志按统一模板输出: 标题+配置 → 明细 → 警告 → 执行结果 → 汇总。"""
+    _d, _w = [], []
+    _log_out = log
+
+    def log(msg):
+        (_w if msg.strip().startswith("[警告]") else _d).append(msg)
+
+    def flush():
+        if _d or _w:
+            _log_out("\n".join(_d + _w))
+            _d.clear()
+            _w.clear()
+
+    tot_blocked = 0    # 公式拦截数
+    tot_unmatched = 0  # 键值未匹配数
+
     src_key_col = groups.get(key_group, {}).get(src)
     if not src_key_col:
         log(f"[错误] 数据源表格在映射组「{key_group}」里没有登记字段")
+        flush()
         return 0
     try:
         swb, sws, shdr = read_sheet(base_dir / src[0], src[1])
     except Exception as ex:
         log(f"[错误] 读取数据源失败: {ex}")
+        flush()
         return 0
     if src_key_col not in shdr:
         log(f"[错误] 数据源表头里找不到键列「{src_key_col}」")
@@ -492,11 +539,13 @@ def run_sync(base_dir, groups, key_group, src, sync_groups, targets, backup_dir,
         src_fields[g] = shdr[col]
     if not src_fields:
         log("[中止] 数据源没有任何可同步的字段")
+        flush()
         return 0
 
     key_c = shdr[src_key_col]
     src_data = {}
     dup_keys = 0
+    formula_src = []  # (行号, 映射组) 源值是公式的
     for r in range(2, sws.max_row + 1):
         k = norm(sws.cell(r, key_c).value)
         if not k:
@@ -504,8 +553,19 @@ def run_sync(base_dir, groups, key_group, src, sync_groups, targets, backup_dir,
         if k in src_data:
             dup_keys += 1
             continue
-        src_data[k] = {g: sws.cell(r, c).value for g, c in src_fields.items()}
+        vals = {}
+        for g, c in src_fields.items():
+            v = sws.cell(r, c).value
+            if is_formula_like(v):
+                formula_src.append((r, g))
+                v = None  # 公式不同步，视同空值跳过
+            vals[g] = v
+        src_data[k] = vals
     swb.close()
+    if formula_src:
+        sample = ", ".join(f"行{r}「{g}」" for r, g in formula_src[:5])
+        log(f"[警告] 数据源有 {len(formula_src)} 个值是公式，已跳过（工具不同步公式内容）: {sample}"
+            + (" ……" if len(formula_src) > 5 else ""))
     if dup_keys:
         log(f"[提示] 数据源有 {dup_keys} 个重复的键值，已取首次出现的行")
     log(f"数据源: {src[0]} | {src[1]}，共 {len(src_data)} 个键值")
@@ -513,101 +573,167 @@ def run_sync(base_dir, groups, key_group, src, sync_groups, targets, backup_dir,
 
     total_changes = 0
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # 按文件分批: 每个文件 打开一次 → 校验并生成变更计划 → 备份一次 → 应用全部修改 → 原子保存
+    by_file = {}
     for tgt in targets:
         if tgt == src:
             continue
-        label = f"{tgt[0]} | {tgt[1]}"
-        tgt_key_col = groups.get(key_group, {}).get(tgt)
-        if not tgt_key_col:
-            log(f"[跳过] {label}: 在映射组「{key_group}」里没有登记字段")
-            continue
-        try:
-            twb, tws, thdr = read_sheet(base_dir / tgt[0], tgt[1])
-        except Exception as ex:
-            log(f"[错误] {label}: {ex}")
-            continue
-        if tgt_key_col not in thdr:
-            log(f"[跳过] {label}: 表头里找不到键列「{tgt_key_col}」")
-            continue
-        tgt_fields = {}
-        for g in src_fields:
-            col = groups.get(g, {}).get(tgt)
-            if not col:
-                log(f"[提示] {label}: 在映射组「{g}」里没有登记字段，该组跳过")
-                continue
-            if col not in thdr:
-                log(f"[提示] {label}: 表头里找不到字段列「{col}」，该组跳过")
-                continue
-            tgt_fields[g] = thdr[col]
-        if not tgt_fields:
-            log(f"[跳过] {label}: 没有可同步的字段")
-            continue
+        by_file.setdefault(tgt[0], []).append(tgt)
 
-        kc = thdr[tgt_key_col]
-        changes = []
-        hit_keys = set()
-        for r in range(2, tws.max_row + 1):
-            k = norm(tws.cell(r, kc).value)
-            if not k or k not in src_data:
+    results = []
+    for f, tgts in by_file.items():
+        try:
+            twb = openpyxl.load_workbook(base_dir / f)
+        except Exception as ex:
+            log(f"[错误] {f}: 打开失败: {ex}")
+            results.append(f"{f}: 打开失败（{ex}）")
+            continue
+        file_changes = 0
+        for tgt in tgts:
+            s = tgt[1]
+            label = f"{f} | {s}"
+            tgt_key_col = groups.get(key_group, {}).get(tgt)
+            if not tgt_key_col:
+                log(f"[跳过] {label}: 在映射组「{key_group}」里没有登记字段")
                 continue
-            hit_keys.add(k)
-            for g, c in tgt_fields.items():
-                v = src_data[k][g]
-                if v is None or norm(v) == "":
-                    continue  # 源值为空不同步
-                cell = tws.cell(r, c)
-                if norm(cell.value) != norm(v):
-                    changes.append((r, g, cell.value, v))
-                    if not dry:
-                        cell.value = v
-        if changes:
-            total_changes += len(changes)
-            log(f"\n{'[预览] ' if dry else ''}{label}: {len(changes)} 处改动")
-            for r, g, old, new in changes[:200]:
-                log(f"  行{r} 「{groups[g][tgt]}」: {old!r} -> {new!r}")
-            if len(changes) > 200:
-                log(f"  …… 其余 {len(changes) - 200} 处省略")
-            if not dry:
-                if backup_dir:
-                    bdir = Path(backup_dir)
-                    bdir.mkdir(parents=True, exist_ok=True)
-                    tp = base_dir / tgt[0]
-                    safe = "__".join(Path(tgt[0]).with_suffix("").parts)
-                    shutil.copy2(tp, bdir / f"{safe}.{stamp}{tp.suffix}")
-                twb.save(base_dir / tgt[0])
-                log(f"  [已保存] {tgt[0]}")
+            if s not in twb.sheetnames:
+                log(f"[错误] {label}: 工作表不存在")
+                continue
+            tws = twb[s]
+            thdr = header_map_of(tws)
+            if tgt_key_col not in thdr:
+                log(f"[跳过] {label}: 表头里找不到键列「{tgt_key_col}」")
+                continue
+            tgt_fields = {}
+            for g in src_fields:
+                col = groups.get(g, {}).get(tgt)
+                if not col:
+                    log(f"[提示] {label}: 在映射组「{g}」里没有登记字段，该组跳过")
+                    continue
+                if col not in thdr:
+                    log(f"[提示] {label}: 表头里找不到字段列「{col}」，该组跳过")
+                    continue
+                tgt_fields[g] = thdr[col]
+            if not tgt_fields:
+                log(f"[跳过] {label}: 没有可同步的字段")
+                continue
+
+            # 生成变更计划（不立即修改）
+            kc = thdr[tgt_key_col]
+            changes = []
+            hit_keys = set()
+            formula_tgt = 0  # 目标是公式而被拦截的单元格数
+            for r in range(2, tws.max_row + 1):
+                k = norm(tws.cell(r, kc).value)
+                if not k or k not in src_data:
+                    continue
+                hit_keys.add(k)
+                for g, c in tgt_fields.items():
+                    v = src_data[k][g]
+                    if v is None or norm(v) == "":
+                        continue  # 源值为空不同步
+                    cell = tws.cell(r, c)
+                    if is_formula_like(cell.value):
+                        formula_tgt += 1  # 目标是公式，不覆盖
+                        continue
+                    if norm(cell.value) != norm(v):
+                        changes.append((r, g, cell.value, v))
+            if changes:
+                total_changes += len(changes)
+                file_changes += len(changes)
+                log(f"\n{'[预览] ' if dry else ''}{label}: {len(changes)} 处改动")
+                for r, g, old, new in changes[:200]:
+                    log(f"  行{r} 「{groups[g][tgt]}」: {old!r} -> {new!r}")
+                if len(changes) > 200:
+                    log(f"  …… 其余 {len(changes) - 200} 处省略")
+                if not dry:
+                    for r, g, old, new in changes:
+                        tws.cell(r, tgt_fields[g]).value = new
+            else:
+                log(f"{label}: 无需改动（值已一致）")
+            if formula_tgt:
+                tot_blocked += formula_tgt
+                log(f"  [警告] {label}: {formula_tgt} 个目标单元格是公式，未覆盖（工具不改动公式）")
+            missing = set(src_data) - hit_keys
+            if missing:
+                tot_unmatched += len(missing)
+                sample = ", ".join(sorted(missing)[:10])
+                log(f"  [提示] {label}: 有 {len(missing)} 个数据源的键值未匹配到行（{sample}{' ……' if len(missing) > 10 else ''}）")
+
+        if not file_changes:
+            results.append(f"{f}: 无需改动")
+        elif dry:
+            results.append(f"{f}: 预览 {file_changes} 处改动")
         else:
-            log(f"{label}: 无需改动（值已一致）")
-        missing = set(src_data) - hit_keys
-        if missing:
-            sample = ", ".join(sorted(missing)[:10])
-            log(f"  [提示] {label}: 有 {len(missing)} 个数据源的键值未匹配到行（{sample}{' ……' if len(missing) > 10 else ''}）")
+            try:
+                bak = save_with_backup(twb, f, base_dir, backup_dir, stamp)
+                log(f"[已保存] {f}（本批共 {file_changes} 处改动，已按原始状态备份）")
+                results.append(f"{f}: {file_changes} 处改动，已保存"
+                               + (f"（备份: {bak}）" if bak else "（未备份）"))
+            except Exception as ex:
+                log(f"[错误] {f}: 保存失败: {ex}（原文件未被修改）")
+                results.append(f"{f}: 保存失败（{ex}），原文件未被修改")
         twb.close()
 
-    log(f"\n{'预览完成' if dry else '同步完成'}: 共 {total_changes} 处改动")
+    tot_blocked += len(formula_src)
+    out = [f"【同步】{datetime.now():%Y-%m-%d %H:%M:%S}"]
+    out.append(f"配置: 键={key_group} | 源={src[0]}|{src[1]} | 同步组={', '.join(sync_groups)} | 目标={len(by_file)} 个文件")
+    out.append("─" * 46)
+    out.append("明细:")
+    out.extend(f"  {l}" for l in _d)
+    out.append("警告:")
+    if _w:
+        out.extend(f"  {l}" for l in _w)
+    else:
+        out.append("  无")
+    out.append("─" * 46)
+    out.append("执行结果:")
+    out.extend(f"  {l}" for l in results)
+    out.append(f"汇总: 改动 {total_changes} | 公式拦截 {tot_blocked} | 未匹配 {tot_unmatched} | 状态: {'预览(未写入)' if dry else '成功'}")
+    _log_out("\n".join(out))
     return total_changes
 
 
 def run_replace(base_dir, groups, src_group, dst_group, ref, targets, backup_dir, dry, log):
     """字段替换: 把 targets 各列中属于 src_group 的值，按参照表 ref 翻译成 dst_group 的值。
     ref = (文件, 表格); targets = [(文件, 表格, 字段名), ...]。
-    只改数据区（第 2 行起），表头不动。返回替换单元格数。"""
+    只改数据区（第 2 行起），表头不动。返回替换单元格数。
+    日志按统一模板输出: 标题+配置 → 明细 → 警告 → 执行结果 → 汇总。"""
+    _d, _w = [], []
+    _log_out = log
+
+    def log(msg):
+        (_w if msg.strip().startswith("[警告]") else _d).append(msg)
+
+    def flush():
+        if _d or _w:
+            _log_out("\n".join(_d + _w))
+            _d.clear()
+            _w.clear()
+
+    tot_blocked = 0    # 公式拦截数
+    tot_unmatched = 0  # 参照表查不到的值个数
+
     src_col = groups.get(src_group, {}).get(ref)
     dst_col = groups.get(dst_group, {}).get(ref)
     if not src_col or not dst_col:
         log("[错误] 参照表没有同时登记源组和目标组的字段")
+        flush()
         return 0
     try:
         rwb, rws, rhdr = read_sheet(base_dir / ref[0], ref[1])
     except Exception as ex:
         log(f"[错误] 读取参照表失败: {ex}")
+        flush()
         return 0
     if src_col not in rhdr or dst_col not in rhdr:
         log(f"[错误] 参照表表头里找不到列「{src_col}」或「{dst_col}」")
         rwb.close()
+        flush()
         return 0
     mapping = {}
     dup = 0
+    formula_ref = 0  # 参照值是公式的条数
     for r in range(2, rws.max_row + 1):
         k = norm(rws.cell(r, rhdr[src_col]).value)
         if not k:
@@ -615,83 +741,304 @@ def run_replace(base_dir, groups, src_group, dst_group, ref, targets, backup_dir
         if k in mapping:
             dup += 1
             continue
-        mapping[k] = rws.cell(r, rhdr[dst_col]).value
+        v_dst = rws.cell(r, rhdr[dst_col]).value
+        if is_formula_like(v_dst):
+            formula_ref += 1
+            v_dst = None  # 公式不作为参照值，视同空值跳过
+        mapping[k] = v_dst
     dst_vals = {norm(v) for v in mapping.values() if norm(v)}
     rwb.close()
     if dup:
         log(f"[提示] 参照表有 {dup} 个重复的「{src_group}」值，已取首次出现的行")
+    if formula_ref:
+        log(f"[警告] 参照表有 {formula_ref} 条对照的取值是公式，已跳过（工具不处理公式内容）")
     log(f"参照表: {ref[0]} | {ref[1]}（{src_col} → {dst_col}），共 {len(mapping)} 条对照")
     log(f"翻译规则: 「{src_group}」→「{dst_group}」")
 
     total = 0
     stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    # 按文件分批: 每个文件 打开一次 → 校验并生成变更计划 → 备份一次 → 应用全部修改 → 原子保存
+    by_file = {}
     for f, s, col in targets:
-        label = f"{f} | {s} | {col}"
+        by_file.setdefault(f, []).append((s, col))
+
+    results = []
+    for f, entries in by_file.items():
         try:
-            twb, tws, thdr = read_sheet(base_dir / f, s)
+            twb = openpyxl.load_workbook(base_dir / f)
         except Exception as ex:
-            log(f"[错误] {label}: {ex}")
+            log(f"[错误] {f}: 打开失败: {ex}")
+            results.append(f"{f}: 打开失败（{ex}）")
             continue
-        if col not in thdr:
-            log(f"[跳过] {label}: 表头里找不到该列")
-            twb.close()
-            continue
-        c = thdr[col]
-        changes = []
-        unmatched = {}
-        already = 0
-        empty_dst = 0
-        for r in range(2, tws.max_row + 1):
-            cell = tws.cell(r, c)
-            v = cell.value
-            if v is None or norm(v) == "":
+        file_changes = 0
+        for s, col in entries:
+            label = f"{f} | {s} | {col}"
+            if s not in twb.sheetnames:
+                log(f"[错误] {label}: 工作表不存在")
                 continue
-            k = norm(v)
-            if k in mapping:
-                pass  # 待替换
-            elif k in dst_vals:
-                already += 1  # 已是目标值，跳过
+            tws = twb[s]
+            thdr = header_map_of(tws)
+            if col not in thdr:
+                log(f"[跳过] {label}: 表头里找不到该列")
                 continue
-            else:
-                unmatched[k] = unmatched.get(k, 0) + 1
-                continue
-            new = mapping[k]
-            if new is None or norm(new) == "":
-                empty_dst += 1
-                continue
-            if norm(v) != norm(new):
-                changes.append((r, v, new))
+            # 生成变更计划（不立即修改）
+            c = thdr[col]
+            changes = []
+            unmatched = {}
+            already = 0
+            empty_dst = 0
+            formula_tgt = 0  # 目标是公式而被拦截的单元格数
+            for r in range(2, tws.max_row + 1):
+                cell = tws.cell(r, c)
+                v = cell.value
+                if v is None or norm(v) == "":
+                    continue
+                if is_formula_like(v):
+                    formula_tgt += 1  # 目标是公式，不替换
+                    continue
+                k = norm(v)
+                if k in mapping:
+                    pass  # 待替换
+                elif k in dst_vals:
+                    already += 1  # 已是目标值，跳过
+                    continue
+                else:
+                    unmatched[k] = unmatched.get(k, 0) + 1
+                    continue
+                new = mapping[k]
+                if new is None or norm(new) == "":
+                    empty_dst += 1
+                    continue
+                if norm(v) != norm(new):
+                    changes.append((r, v, new))
+            if changes:
+                total += len(changes)
+                file_changes += len(changes)
+                log(f"\n{'[预览] ' if dry else ''}{label}: {len(changes)} 处替换")
+                for r, old, new in changes[:200]:
+                    log(f"  行{r}: {old!r} -> {new!r}")
+                if len(changes) > 200:
+                    log(f"  …… 其余 {len(changes) - 200} 处省略")
                 if not dry:
-                    cell.value = new
-        if changes:
-            total += len(changes)
-            log(f"\n{'[预览] ' if dry else ''}{label}: {len(changes)} 处替换")
-            for r, old, new in changes[:200]:
-                log(f"  行{r}: {old!r} -> {new!r}")
-            if len(changes) > 200:
-                log(f"  …… 其余 {len(changes) - 200} 处省略")
-            if not dry:
-                if backup_dir:
-                    bdir = Path(backup_dir)
-                    bdir.mkdir(parents=True, exist_ok=True)
-                    tp = base_dir / f
-                    safe = "__".join(Path(f).with_suffix("").parts)
-                    shutil.copy2(tp, bdir / f"{safe}.{stamp}{tp.suffix}")
-                twb.save(base_dir / f)
-                log(f"  [已保存] {f}")
+                    for r, old, new in changes:
+                        tws.cell(r, c).value = new
+            else:
+                log(f"{label}: 无需替换")
+            if unmatched:
+                tot_unmatched += sum(unmatched.values())
+                items = ", ".join(f"{k!r}×{n}" for k, n in sorted(unmatched.items())[:10])
+                log(f"  [提示] {label}: {sum(unmatched.values())} 个值在参照表找不到（保留原值）: {items}"
+                    + (" ……" if len(unmatched) > 10 else ""))
+            if already:
+                log(f"  [提示] {label}: {already} 个单元格已是「{dst_group}」的值，已跳过")
+            if formula_tgt:
+                tot_blocked += formula_tgt
+                log(f"  [警告] {label}: {formula_tgt} 个目标单元格是公式，未替换（工具不改动公式）")
+            if empty_dst:
+                log(f"  [提示] {label}: {empty_dst} 个值在参照表中的目标列为空（保留原值）")
+
+        if not file_changes:
+            results.append(f"{f}: 无需改动")
+        elif dry:
+            results.append(f"{f}: 预览 {file_changes} 处替换")
         else:
-            log(f"{label}: 无需替换")
-        if unmatched:
-            items = ", ".join(f"{k!r}×{n}" for k, n in sorted(unmatched.items())[:10])
-            log(f"  [提示] {label}: {sum(unmatched.values())} 个值在参照表找不到（保留原值）: {items}"
-                + (" ……" if len(unmatched) > 10 else ""))
-        if already:
-            log(f"  [提示] {label}: {already} 个单元格已是「{dst_group}」的值，已跳过")
-        if empty_dst:
-            log(f"  [提示] {label}: {empty_dst} 个值在参照表中的目标列为空（保留原值）")
+            try:
+                bak = save_with_backup(twb, f, base_dir, backup_dir, stamp)
+                log(f"[已保存] {f}（本批共 {file_changes} 处替换，已按原始状态备份）")
+                results.append(f"{f}: {file_changes} 处替换，已保存"
+                               + (f"（备份: {bak}）" if bak else "（未备份）"))
+            except Exception as ex:
+                log(f"[错误] {f}: 保存失败: {ex}（原文件未被修改）")
+                results.append(f"{f}: 保存失败（{ex}），原文件未被修改")
         twb.close()
 
-    log(f"\n{'预览完成' if dry else '替换完成'}: 共 {total} 处替换")
+    tot_blocked += formula_ref
+    out = [f"【替换-按参照表】{datetime.now():%Y-%m-%d %H:%M:%S}"]
+    out.append(f"配置: 规则={src_group}→{dst_group} | 参照={ref[0]}|{ref[1]} | 目标={len(by_file)} 个文件")
+    out.append("─" * 46)
+    out.append("明细:")
+    out.extend(f"  {l}" for l in _d)
+    out.append("警告:")
+    if _w:
+        out.extend(f"  {l}" for l in _w)
+    else:
+        out.append("  无")
+    out.append("─" * 46)
+    out.append("执行结果:")
+    out.extend(f"  {l}" for l in results)
+    out.append(f"汇总: 替换 {total} | 公式拦截 {tot_blocked} | 未匹配 {tot_unmatched} | 状态: {'预览(未写入)' if dry else '成功'}")
+    _log_out("\n".join(out))
+    return total
+
+
+def run_replace_align(base_dir, ref, match_col, value_col, targets, backup_dir, dry, log):
+    """按字段匹配替换: 目标列不按自身值查, 而是取同一行的匹配字段值,
+    去参照表(ref)的匹配列(match_col)对齐行, 把该行的取值列(value_col)写入目标列。
+    目标子表需有与 match_col 同名的列。只改数据区（第 2 行起），表头不动。
+    ref = (文件, 表格); targets = [(文件, 表格, 字段名), ...]。返回替换单元格数。
+    日志按统一模板输出: 标题+配置 → 明细 → 警告 → 执行结果 → 汇总。"""
+    _d, _w = [], []
+    _log_out = log
+
+    def log(msg):
+        (_w if msg.strip().startswith("[警告]") else _d).append(msg)
+
+    def flush():
+        if _d or _w:
+            _log_out("\n".join(_d + _w))
+            _d.clear()
+            _w.clear()
+
+    tot_blocked = 0
+    tot_unmatched = 0
+
+    try:
+        rwb, rws, rhdr = read_sheet(base_dir / ref[0], ref[1])
+    except Exception as ex:
+        log(f"[错误] 读取参照表失败: {ex}")
+        flush()
+        return 0
+    if match_col not in rhdr or value_col not in rhdr:
+        log(f"[错误] 参照表表头里找不到列「{match_col}」或「{value_col}」")
+        rwb.close()
+        flush()
+        return 0
+    mapping = {}
+    dup = 0
+    formula_ref = 0  # 参照值是公式的条数
+    for r in range(2, rws.max_row + 1):
+        k = norm(rws.cell(r, rhdr[match_col]).value)
+        if not k:
+            continue
+        if k in mapping:
+            dup += 1
+            continue
+        v_dst = rws.cell(r, rhdr[value_col]).value
+        if is_formula_like(v_dst):
+            formula_ref += 1
+            v_dst = None  # 公式不作为参照值，视同空值跳过
+        mapping[k] = v_dst
+    dst_vals = {norm(v) for v in mapping.values() if norm(v)}
+    rwb.close()
+    if dup:
+        log(f"[提示] 参照表有 {dup} 个重复的「{match_col}」值，已取首次出现的行")
+    if formula_ref:
+        log(f"[警告] 参照表有 {formula_ref} 条对照的取值是公式，已跳过（工具不处理公式内容）")
+    log(f"参照表: {ref[0]} | {ref[1]}（按「{match_col}」对齐，取「{value_col}」），共 {len(mapping)} 条对照")
+
+    total = 0
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    by_file = {}
+    for f, s, col in targets:
+        by_file.setdefault(f, []).append((s, col))
+
+    results = []
+    for f, entries in by_file.items():
+        try:
+            twb = openpyxl.load_workbook(base_dir / f)
+        except Exception as ex:
+            log(f"[错误] {f}: 打开失败: {ex}")
+            results.append(f"{f}: 打开失败（{ex}）")
+            continue
+        file_changes = 0
+        for s, col in entries:
+            label = f"{f} | {s} | {col}"
+            if s not in twb.sheetnames:
+                log(f"[错误] {label}: 工作表不存在")
+                continue
+            tws = twb[s]
+            thdr = header_map_of(tws)
+            if col not in thdr:
+                log(f"[跳过] {label}: 表头里找不到该列")
+                continue
+            if match_col not in thdr:
+                log(f"[跳过] {label}: 该表没有匹配列「{match_col}」，无法对齐")
+                continue
+            if col == match_col:
+                log(f"[跳过] {label}: 目标列与匹配列相同")
+                continue
+            mc, c = thdr[match_col], thdr[col]
+            changes = []
+            unmatched = {}
+            already = 0
+            empty_dst = 0
+            formula_tgt = 0  # 目标是公式而被拦截的单元格数
+            for r in range(2, tws.max_row + 1):
+                kv = norm(tws.cell(r, mc).value)
+                if not kv:
+                    continue
+                if kv not in mapping:
+                    unmatched[kv] = unmatched.get(kv, 0) + 1
+                    continue
+                new = mapping[kv]
+                if new is None or norm(new) == "":
+                    empty_dst += 1
+                    continue
+                cell = tws.cell(r, c)
+                if is_formula_like(cell.value):
+                    formula_tgt += 1  # 目标是公式，不替换
+                    continue
+                if norm(cell.value) == norm(new):
+                    already += 1
+                    continue
+                changes.append((r, cell.value, new))
+            if changes:
+                total += len(changes)
+                file_changes += len(changes)
+                log(f"\n{'[预览] ' if dry else ''}{label}: {len(changes)} 处替换")
+                for r, old, new in changes[:200]:
+                    log(f"  行{r}: {old!r} -> {new!r}")
+                if len(changes) > 200:
+                    log(f"  …… 其余 {len(changes) - 200} 处省略")
+                if not dry:
+                    for r, old, new in changes:
+                        tws.cell(r, c).value = new
+            else:
+                log(f"{label}: 无需替换")
+            if unmatched:
+                tot_unmatched += sum(unmatched.values())
+                items = ", ".join(f"{k!r}×{n}" for k, n in sorted(unmatched.items())[:10])
+                log(f"  [提示] {label}: {sum(unmatched.values())} 行的「{match_col}」在参照表找不到（保留原值）: {items}"
+                    + (" ……" if len(unmatched) > 10 else ""))
+            if already:
+                log(f"  [提示] {label}: {already} 个单元格已与参照值一致，已跳过")
+            if formula_tgt:
+                tot_blocked += formula_tgt
+                log(f"  [警告] {label}: {formula_tgt} 个目标单元格是公式，未替换（工具不改动公式）")
+            if empty_dst:
+                log(f"  [提示] {label}: {empty_dst} 行在参照表中的「{value_col}」为空（保留原值）")
+
+        if not file_changes:
+            results.append(f"{f}: 无需改动")
+        elif dry:
+            results.append(f"{f}: 预览 {file_changes} 处替换")
+        else:
+            try:
+                bak = save_with_backup(twb, f, base_dir, backup_dir, stamp)
+                log(f"[已保存] {f}（本批共 {file_changes} 处替换，已按原始状态备份）")
+                results.append(f"{f}: {file_changes} 处替换，已保存"
+                               + (f"（备份: {bak}）" if bak else "（未备份）"))
+            except Exception as ex:
+                log(f"[错误] {f}: 保存失败: {ex}（原文件未被修改）")
+                results.append(f"{f}: 保存失败（{ex}），原文件未被修改")
+        twb.close()
+
+    tot_blocked += formula_ref
+    out = [f"【替换-按字段匹配】{datetime.now():%Y-%m-%d %H:%M:%S}"]
+    out.append(f"配置: 参照={ref[0]}|{ref[1]} | 对齐={match_col} | 取值={value_col} | 目标={len(by_file)} 个文件")
+    out.append("─" * 46)
+    out.append("明细:")
+    out.extend(f"  {l}" for l in _d)
+    out.append("警告:")
+    if _w:
+        out.extend(f"  {l}" for l in _w)
+    else:
+        out.append("  无")
+    out.append("─" * 46)
+    out.append("执行结果:")
+    out.extend(f"  {l}" for l in results)
+    out.append(f"汇总: 替换 {total} | 公式拦截 {tot_blocked} | 未匹配 {tot_unmatched} | 状态: {'预览(未写入)' if dry else '成功'}")
+    _log_out("\n".join(out))
     return total
 
 
@@ -1148,8 +1495,11 @@ class App(tk.Tk):
         ttk.Button(rbtn, text="全选当前列表", command=self._rp_select_all_shown).pack(side=tk.LEFT)
         ttk.Button(rbtn, text="清空已选", command=self._rp_clear_selected).pack(side=tk.LEFT, padx=6)
 
-        rtop = ttk.Frame(tab_rp, padding=8)
-        rtop.pack(fill=tk.X)
+        self.nb2 = ttk.Notebook(tab_rp)
+        self.nb2.pack(fill=tk.X, padx=4, pady=4)
+
+        rtop = ttk.Frame(self.nb2, padding=8)
+        self.nb2.add(rtop, text="按参照表（映射组）")
         ttk.Label(rtop, text="② 当前值是:").grid(row=0, column=0, sticky=tk.W)
         self.rp_src_var = tk.StringVar()
         self.rp_src_box = ttk.Combobox(rtop, textvariable=self.rp_src_var, state="readonly", width=16)
@@ -1164,6 +1514,24 @@ class App(tk.Tk):
         self.rp_ref_var = tk.StringVar()
         self.rp_ref_box = ttk.Combobox(rtop, textvariable=self.rp_ref_var, state="readonly", width=34)
         self.rp_ref_box.grid(row=0, column=5, sticky=tk.W, padx=4)
+
+        rp2 = ttk.Frame(self.nb2, padding=8)
+        self.nb2.add(rp2, text="按字段匹配")
+        ttk.Label(rp2, text="② 参照表格:").grid(row=0, column=0, sticky=tk.W)
+        self.rp2_sheet_var = tk.StringVar()
+        self.rp2_sheet_box = ttk.Combobox(rp2, textvariable=self.rp2_sheet_var, state="readonly", width=34)
+        self.rp2_sheet_box.grid(row=0, column=1, sticky=tk.W, padx=4)
+        self.rp2_sheet_box.bind("<<ComboboxSelected>>", lambda e: self._rp2_on_sheet())
+        ttk.Label(rp2, text="③ 匹配字段:").grid(row=0, column=2, sticky=tk.W, padx=(12, 0))
+        self.rp2_match_var = tk.StringVar()
+        self.rp2_match_box = ttk.Combobox(rp2, textvariable=self.rp2_match_var, state="readonly", width=16)
+        self.rp2_match_box.grid(row=0, column=3, sticky=tk.W, padx=4)
+        ttk.Label(rp2, text="④ 取值字段:").grid(row=0, column=4, sticky=tk.W, padx=(12, 0))
+        self.rp2_value_var = tk.StringVar()
+        self.rp2_value_box = ttk.Combobox(rp2, textvariable=self.rp2_value_var, state="readonly", width=16)
+        self.rp2_value_box.grid(row=0, column=5, sticky=tk.W, padx=4)
+        ttk.Label(rp2, text="（目标子表需有与匹配字段同名的列，按它对齐行后把取值字段的值写入被替换列）",
+                  foreground="#888888").grid(row=1, column=0, columnspan=6, sticky=tk.W, pady=(4, 0))
 
         # ---------- 共享操作栏和日志 ----------
         bar = ttk.Frame(self, padding=8)
@@ -1334,13 +1702,16 @@ class App(tk.Tk):
         self.rp_src_box["values"] = all_groups
         self.rp_dst_box["values"] = all_groups
         # 字段池 = 所有表格的全部字段(含未登记), 保证替换功能通用
+        self._rp_tables = scan_tables(self.base_dir, self.tool_path, self.backup_dir,
+                                      cache_dir=self.app_dir)
         self._rp_all = [
             (f, s, col)
-            for f, sheets in scan_tables(self.base_dir, self.tool_path, self.backup_dir,
-                                         cache_dir=self.app_dir)
+            for f, sheets in self._rp_tables
             for s, hdr in sheets
             for col in hdr
         ]
+        self._rp2_flat = [(f, s, hdr) for f, sheets in self._rp_tables for s, hdr in sheets]
+        self.rp2_sheet_box["values"] = [f"{f} | {s}" for f, s, _ in self._rp2_flat]
         # 清理已失效的已选字段
         if hasattr(self, "_rp_selected"):
             self._rp_selected &= set(self._rp_all)
@@ -1424,6 +1795,16 @@ class App(tk.Tk):
     def _update_rp_count(self):
         self.rp_count.config(text=f"已选 {len(self._rp_selected)} 个字段")
 
+    def _rp2_on_sheet(self):
+        pos = self.rp2_sheet_box.current()
+        if pos < 0:
+            return
+        hdr = self._rp2_flat[pos][2]
+        self.rp2_match_box["values"] = hdr
+        self.rp2_value_box["values"] = hdr
+        self.rp2_match_var.set("")
+        self.rp2_value_var.set("")
+
     def _refresh_rp_ref(self):
         s, d = self.rp_src_var.get(), self.rp_dst_var.get()
         cands = []
@@ -1440,8 +1821,10 @@ class App(tk.Tk):
     def _run(self, dry):
         if self.nb.index(self.nb.select()) == 0:
             self._run_sync(dry)
-        else:
+        elif self.nb2.index(self.nb2.select()) == 0:
             self._run_replace(dry)
+        else:
+            self._run_replace_align(dry)
 
     def _run_sync(self, dry):
         g = self.grp_var.get()
@@ -1501,6 +1884,35 @@ class App(tk.Tk):
         try:
             run_replace(self.base_dir, self.groups, s, d, ref, targets,
                         self.backup_dir if self.backup_var.get() else None, dry, self._log)
+        except Exception as ex:
+            self._log(f"[错误] {ex}")
+    def _run_replace_align(self, dry):
+        if not self._rp_selected:
+            messagebox.showwarning("缺少选择", "请先勾选被替换字段")
+            return
+        targets = list(dict.fromkeys(
+            it[:3] for it in sorted(self._rp_selected, key=self._rp_label)))
+        pos = self.rp2_sheet_box.current()
+        if pos < 0:
+            messagebox.showwarning("缺少选择", "请选择参照表格")
+            return
+        f, s, hdr = self._rp2_flat[pos]
+        m, v = self.rp2_match_var.get(), self.rp2_value_var.get()
+        if not m or not v:
+            messagebox.showwarning("缺少选择", "请选择匹配字段和取值字段")
+            return
+        if m == v:
+            messagebox.showwarning("选择有误", "匹配字段和取值字段不能相同")
+            return
+        if not dry and not messagebox.askyesno(
+            "确认替换",
+            f"被替换字段: {len(targets)} 个\n参照表: {f} | {s}\n"
+            f"按「{m}」对齐行，把「{v}」的值写入被替换列\n\n只会改写数据区，表头不动。确定执行？"):
+            return
+        self._log("=" * 60)
+        try:
+            run_replace_align(self.base_dir, (f, s), m, v, targets,
+                              self.backup_dir if self.backup_var.get() else None, dry, self._log)
         except Exception as ex:
             self._log(f"[错误] {ex}")
 
