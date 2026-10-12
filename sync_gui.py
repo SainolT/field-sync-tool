@@ -470,8 +470,13 @@ def save_with_backup(wb, rel, base_dir, backup_dir, stamp):
 
 
 def is_formula_like(v):
-    """判断单元格值是否是公式（或以 = 开头的文本，写入后会变成公式，有注入风险）。"""
+    """判断值是否形如公式（以 = 开头的文本，写入后会变成公式，有注入风险）。"""
     return isinstance(v, str) and v.startswith("=")
+
+
+def is_formula_cell(cell):
+    """判断单元格是否是公式: 覆盖普通公式、数组公式(ArrayFormula 对象)和以 = 开头的文本。"""
+    return cell.data_type == "f" or is_formula_like(cell.value)
 
 
 def header_map_of(ws):
@@ -557,8 +562,9 @@ def run_sync(base_dir, groups, key_group, src, sync_groups, targets, backup_dir,
             continue
         vals = {}
         for g, c in src_fields.items():
-            v = sws.cell(r, c).value
-            if is_formula_like(v):
+            cell = sws.cell(r, c)
+            v = cell.value
+            if is_formula_cell(cell):
                 formula_src.append((r, g))
                 v = None  # 公式不同步，视同空值跳过
             vals[g] = v
@@ -636,7 +642,7 @@ def run_sync(base_dir, groups, key_group, src, sync_groups, targets, backup_dir,
                     if v is None or norm(v) == "":
                         continue  # 源值为空不同步
                     cell = tws.cell(r, c)
-                    if is_formula_like(cell.value):
+                    if is_formula_cell(cell):
                         formula_tgt += 1  # 目标是公式，不覆盖
                         continue
                     if norm(cell.value) != norm(v):
@@ -757,8 +763,9 @@ def run_replace(base_dir, groups, src_group, dst_group, ref, targets, backup_dir
         if k in mapping:
             dup += 1
             continue
-        v_dst = rws.cell(r, rhdr[dst_col]).value
-        if is_formula_like(v_dst):
+        cell = rws.cell(r, rhdr[dst_col])
+        v_dst = cell.value
+        if is_formula_cell(cell):
             formula_ref += 1
             v_dst = None  # 公式不作为参照值，视同空值跳过
         mapping[k] = v_dst
@@ -810,8 +817,8 @@ def run_replace(base_dir, groups, src_group, dst_group, ref, targets, backup_dir
                 v = cell.value
                 if v is None or norm(v) == "":
                     continue
-                if is_formula_like(v):
-                    formula_tgt += 1  # 目标是公式，不替换
+                if is_formula_cell(cell):
+                    formula_tgt += 1  # 目标是公式(含数组公式)，不替换
                     continue
                 k = norm(v)
                 if k in mapping:
@@ -943,8 +950,9 @@ def run_replace_align(base_dir, ref, match_col, value_col, targets, backup_dir, 
         if k in mapping:
             dup += 1
             continue
-        v_dst = rws.cell(r, rhdr[value_col]).value
-        if is_formula_like(v_dst):
+        cell = rws.cell(r, rhdr[value_col])
+        v_dst = cell.value
+        if is_formula_cell(cell):
             formula_ref += 1
             v_dst = None  # 公式不作为参照值，视同空值跳过
         mapping[k] = v_dst
@@ -1006,8 +1014,8 @@ def run_replace_align(base_dir, ref, match_col, value_col, targets, backup_dir, 
                     empty_dst += 1
                     continue
                 cell = tws.cell(r, c)
-                if is_formula_like(cell.value):
-                    formula_tgt += 1  # 目标是公式，不替换
+                if is_formula_cell(cell):
+                    formula_tgt += 1  # 目标是公式(含数组公式)，不替换
                     continue
                 if norm(cell.value) == norm(new):
                     already += 1
