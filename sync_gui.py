@@ -511,6 +511,8 @@ def run_sync(base_dir, groups, key_group, src, sync_groups, targets, backup_dir,
 
     tot_blocked = 0    # 公式拦截数
     tot_unmatched = 0  # 键值未匹配数
+    saved_changes = 0  # 实际保存成功的改动数
+    failed_files = 0   # 打开或保存失败的文件数
 
     src_key_col = groups.get(key_group, {}).get(src)
     if not src_key_col:
@@ -587,6 +589,7 @@ def run_sync(base_dir, groups, key_group, src, sync_groups, targets, backup_dir,
         except Exception as ex:
             log(f"[错误] {f}: 打开失败: {ex}")
             results.append(f"{f}: 打开失败（{ex}）")
+            failed_files += 1
             continue
         file_changes = 0
         for tgt in tgts:
@@ -667,10 +670,12 @@ def run_sync(base_dir, groups, key_group, src, sync_groups, targets, backup_dir,
         else:
             try:
                 bak = save_with_backup(twb, f, base_dir, backup_dir, stamp)
+                saved_changes += file_changes
                 log(f"[已保存] {f}（本批共 {file_changes} 处改动，已按原始状态备份）")
                 results.append(f"{f}: {file_changes} 处改动，已保存"
                                + (f"（备份: {bak}）" if bak else "（未备份）"))
             except Exception as ex:
+                failed_files += 1
                 log(f"[错误] {f}: 保存失败: {ex}（原文件未被修改）")
                 results.append(f"{f}: 保存失败（{ex}），原文件未被修改")
         twb.close()
@@ -689,7 +694,16 @@ def run_sync(base_dir, groups, key_group, src, sync_groups, targets, backup_dir,
     out.append("─" * 46)
     out.append("执行结果:")
     out.extend(f"  {l}" for l in results)
-    out.append(f"汇总: 改动 {total_changes} | 公式拦截 {tot_blocked} | 未匹配 {tot_unmatched} | 状态: {'预览(未写入)' if dry else '成功'}")
+    if dry:
+        status = "预览(未写入)"
+    elif failed_files == 0:
+        status = "成功"
+    elif saved_changes == 0:
+        status = "失败"
+    else:
+        status = "部分失败"
+    out.append(f"汇总: 计划改动 {total_changes} | 实际保存 {saved_changes} | 公式拦截 {tot_blocked} | "
+               f"未匹配 {tot_unmatched} | 失败文件 {failed_files} | 状态: {status}")
     _log_out("\n".join(out))
     return total_changes
 
@@ -713,6 +727,8 @@ def run_replace(base_dir, groups, src_group, dst_group, ref, targets, backup_dir
 
     tot_blocked = 0    # 公式拦截数
     tot_unmatched = 0  # 参照表查不到的值个数
+    saved_changes = 0  # 实际保存成功的替换数
+    failed_files = 0   # 打开或保存失败的文件数
 
     src_col = groups.get(src_group, {}).get(ref)
     dst_col = groups.get(dst_group, {}).get(ref)
@@ -769,6 +785,7 @@ def run_replace(base_dir, groups, src_group, dst_group, ref, targets, backup_dir
         except Exception as ex:
             log(f"[错误] {f}: 打开失败: {ex}")
             results.append(f"{f}: 打开失败（{ex}）")
+            failed_files += 1
             continue
         file_changes = 0
         for s, col in entries:
@@ -844,10 +861,12 @@ def run_replace(base_dir, groups, src_group, dst_group, ref, targets, backup_dir
         else:
             try:
                 bak = save_with_backup(twb, f, base_dir, backup_dir, stamp)
+                saved_changes += file_changes
                 log(f"[已保存] {f}（本批共 {file_changes} 处替换，已按原始状态备份）")
                 results.append(f"{f}: {file_changes} 处替换，已保存"
                                + (f"（备份: {bak}）" if bak else "（未备份）"))
             except Exception as ex:
+                failed_files += 1
                 log(f"[错误] {f}: 保存失败: {ex}（原文件未被修改）")
                 results.append(f"{f}: 保存失败（{ex}），原文件未被修改")
         twb.close()
@@ -866,7 +885,16 @@ def run_replace(base_dir, groups, src_group, dst_group, ref, targets, backup_dir
     out.append("─" * 46)
     out.append("执行结果:")
     out.extend(f"  {l}" for l in results)
-    out.append(f"汇总: 替换 {total} | 公式拦截 {tot_blocked} | 未匹配 {tot_unmatched} | 状态: {'预览(未写入)' if dry else '成功'}")
+    if dry:
+        status = "预览(未写入)"
+    elif failed_files == 0:
+        status = "成功"
+    elif saved_changes == 0:
+        status = "失败"
+    else:
+        status = "部分失败"
+    out.append(f"汇总: 计划替换 {total} | 实际保存 {saved_changes} | 公式拦截 {tot_blocked} | "
+               f"未匹配 {tot_unmatched} | 失败文件 {failed_files} | 状态: {status}")
     _log_out("\n".join(out))
     return total
 
@@ -891,6 +919,8 @@ def run_replace_align(base_dir, ref, match_col, value_col, targets, backup_dir, 
 
     tot_blocked = 0
     tot_unmatched = 0
+    saved_changes = 0  # 实际保存成功的替换数
+    failed_files = 0   # 打开或保存失败的文件数
 
     try:
         rwb, rws, rhdr = read_sheet(base_dir / ref[0], ref[1])
@@ -939,6 +969,7 @@ def run_replace_align(base_dir, ref, match_col, value_col, targets, backup_dir, 
         except Exception as ex:
             log(f"[错误] {f}: 打开失败: {ex}")
             results.append(f"{f}: 打开失败（{ex}）")
+            failed_files += 1
             continue
         file_changes = 0
         for s, col in entries:
@@ -1015,10 +1046,12 @@ def run_replace_align(base_dir, ref, match_col, value_col, targets, backup_dir, 
         else:
             try:
                 bak = save_with_backup(twb, f, base_dir, backup_dir, stamp)
+                saved_changes += file_changes
                 log(f"[已保存] {f}（本批共 {file_changes} 处替换，已按原始状态备份）")
                 results.append(f"{f}: {file_changes} 处替换，已保存"
                                + (f"（备份: {bak}）" if bak else "（未备份）"))
             except Exception as ex:
+                failed_files += 1
                 log(f"[错误] {f}: 保存失败: {ex}（原文件未被修改）")
                 results.append(f"{f}: 保存失败（{ex}），原文件未被修改")
         twb.close()
@@ -1037,7 +1070,16 @@ def run_replace_align(base_dir, ref, match_col, value_col, targets, backup_dir, 
     out.append("─" * 46)
     out.append("执行结果:")
     out.extend(f"  {l}" for l in results)
-    out.append(f"汇总: 替换 {total} | 公式拦截 {tot_blocked} | 未匹配 {tot_unmatched} | 状态: {'预览(未写入)' if dry else '成功'}")
+    if dry:
+        status = "预览(未写入)"
+    elif failed_files == 0:
+        status = "成功"
+    elif saved_changes == 0:
+        status = "失败"
+    else:
+        status = "部分失败"
+    out.append(f"汇总: 计划替换 {total} | 实际保存 {saved_changes} | 公式拦截 {tot_blocked} | "
+               f"未匹配 {tot_unmatched} | 失败文件 {failed_files} | 状态: {status}")
     _log_out("\n".join(out))
     return total
 
