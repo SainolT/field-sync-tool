@@ -80,6 +80,7 @@ xlsx 是 zip 包。写入时只替换 zip 内目标工作表的 XML：定位并�
 ```bash
 pip install pyinstaller
 python -m PyInstaller --onefile --noconsole --clean --name 字段同步工具 \
+  --exclude-module numpy --exclude-module yaml \
   --exclude-module PIL --exclude-module lxml --exclude-module ssl \
   --exclude-module unittest --exclude-module doctest --exclude-module pydoc \
   --exclude-module turtle --exclude-module lib2to3 --exclude-module xmlrpc \
